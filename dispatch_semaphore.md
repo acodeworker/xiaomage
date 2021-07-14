@@ -244,7 +244,11 @@ setter，getter调用频繁这样太耗费性能，如果非要加锁，可以�
 
 ## 内存管理
 
-NSTimer 和CADisplayLink
+#### NSTimer 和CADisplayLink
+
+基于runloop实现的
+
+对target对象强引用
 
 ```
 @interface MJProxy : NSObject
@@ -274,6 +278,185 @@ NSTimer 和CADisplayLink
 self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:[MJProxy proxyWithTarget:self] selector:@selector(timerTest) userInfo:nil repeats:YES];
 
 ```
+
+### GCD定时器更加准确
+
+不依赖runloop，更加精确
+
+自己封装一个gcd timer
+
+```
+@interface MJTimer : NSObject
+
++ (NSString *)execTask:(void(^)(void))task
+           start:(NSTimeInterval)start
+        interval:(NSTimeInterval)interval
+         repeats:(BOOL)repeats
+           async:(BOOL)async;
+
++ (NSString *)execTask:(id)target
+              selector:(SEL)selector
+                 start:(NSTimeInterval)start
+              interval:(NSTimeInterval)interval
+               repeats:(BOOL)repeats
+                 async:(BOOL)async;
+
++ (void)cancelTask:(NSString *)name;
+
+@end
+
+@implementation MJTimer
+
+static NSMutableDictionary *timers_;
+dispatch_semaphore_t semaphore_;
++ (void)initialize
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        timers_ = [NSMutableDictionary dictionary];
+        semaphore_ = dispatch_semaphore_create(1);
+    });
+}
+
++ (NSString *)execTask:(void (^)(void))task start:(NSTimeInterval)start interval:(NSTimeInterval)interval repeats:(BOOL)repeats async:(BOOL)async
+{
+    if (!task || start < 0 || (interval <= 0 && repeats)) return nil;
+    
+    // 队列
+    dispatch_queue_t queue = async ? dispatch_get_global_queue(0, 0) : dispatch_get_main_queue();
+    
+    // 创建定时器
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    
+    // 设置时间
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, start * NSEC_PER_SEC),
+                              interval * NSEC_PER_SEC, 0);
+    
+    
+    dispatch_semaphore_wait(semaphore_, DISPATCH_TIME_FOREVER);
+    // 定时器的唯一标识
+    NSString *name = [NSString stringWithFormat:@"%zd", timers_.count];
+    // 存放到字典中
+    timers_[name] = timer;
+    dispatch_semaphore_signal(semaphore_);
+    
+    // 设置回调
+    dispatch_source_set_event_handler(timer, ^{
+        task();
+        
+        if (!repeats) { // 不重复的任务
+            [self cancelTask:name];
+        }
+    });
+    
+    // 启动定时器
+    dispatch_resume(timer);
+    
+    return name;
+}
+
++ (NSString *)execTask:(id)target selector:(SEL)selector start:(NSTimeInterval)start interval:(NSTimeInterval)interval repeats:(BOOL)repeats async:(BOOL)async
+{
+    if (!target || !selector) return nil;
+    
+    return [self execTask:^{
+        if ([target respondsToSelector:selector]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [target performSelector:selector];
+#pragma clang diagnostic pop
+        }
+    } start:start interval:interval repeats:repeats async:async];
+}
+
++ (void)cancelTask:(NSString *)name
+{
+    if (name.length == 0) return;
+    
+    dispatch_semaphore_wait(semaphore_, DISPATCH_TIME_FOREVER);
+    
+    dispatch_source_t timer = timers_[name];
+    if (timer) {
+        dispatch_source_cancel(timer);
+        [timers_ removeObjectForKey:name];
+    }
+
+    dispatch_semaphore_signal(semaphore_);
+}
+
+@end
+
+```
+
+### 内存分配
+
+地址从低到高
+
+* 代码段：编译后的代码
+* 数据段:
+  * 字符串常量
+  * 初始化后的全局变量，静态变量
+  * 未初始化后的全局变量，静态变量
+* 堆空间
+  * 内存从低到高分配
+* 栈空间
+  * 局部变量
+  * 内存从高到低分配
+* 内核区
+
+验证过程如下
+
+```
+
+int a = 10;
+int b;
+
+int main(int argc, char * argv[]) {
+    @autoreleasepool {
+        static int c = 20;
+        
+        static int d;
+        
+        int e;
+        int f = 20;
+
+        NSString *str = @"123";
+        
+        NSObject *obj = [[NSObject alloc] init];
+        
+        NSLog(@"\n&a=%p\n&b=%p\n&c=%p\n&d=%p\n&e=%p\n&f=%p\nstr=%p\nobj=%p\n",
+              &a, &b, &c, &d, &e, &f, str, obj);
+        
+        return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+    }
+}
+
+/*
+ 字符串常量
+ str=0x10dfa0068
+ 
+ 已初始化的全局变量、静态变量
+ &a =0x10dfa0db8
+ &c =0x10dfa0dbc
+ 
+ 未初始化的全局变量、静态变量
+ &d =0x10dfa0e80
+ &b =0x10dfa0e84
+ 
+ 堆
+ obj=0x608000012210
+ 
+ 栈
+ &f =0x7ffee1c60fe0
+ &e =0x7ffee1c60fe4
+ */
+
+```
+
+
+
+
 
 
 
